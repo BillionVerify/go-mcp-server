@@ -18,10 +18,10 @@ import (
 )
 
 var (
-	version = "1.0.0" // 版本升级：添加 Webhook 和下载 URL 工具，修复资源 URI 解析
+	version = "1.0.0"
 )
 
-// MCP Server 上下文
+// mcpContext holds global server state.
 var mcpContext *struct {
 	logger    *logrus.Logger
 	apiClient *APIClient
@@ -34,7 +34,7 @@ func init() {
 }
 
 func main() {
-	// 解析命令行参数
+	// Parse CLI flags
 	logLevel := flag.String("log", "info", "Log level (debug, info, warn, error)")
 	httpPort := flag.String("port", "9000", "HTTP server port")
 	apiBaseURL := flag.String("api-url", "", "External API base URL (default: https://api.billionverify.com)")
@@ -42,7 +42,7 @@ func main() {
 
 	logger := logrus.New()
 
-	// 配置日志级别
+	// Configure log level
 	level, err := logrus.ParseLevel(*logLevel)
 	if err != nil {
 		level = logrus.InfoLevel
@@ -51,24 +51,22 @@ func main() {
 	logger.SetFormatter(&logrus.JSONFormatter{})
 	logger.SetOutput(os.Stderr)
 
-	logger.Infof("🚀 Starting BillionVerify MCP Server v%s (API Proxy Mode)", version)
+	logger.Infof("Starting BillionVerify MCP Server v%s", version)
 
-	// 确定 API 基础 URL
+	// Resolve API base URL: flag > env > default
 	baseURL := *apiBaseURL
 	if baseURL == "" {
-		// 从环境变量获取，或使用默认值
-		baseURL = os.Getenv("API_BASE_URL")
+		baseURL = os.Getenv("BILLIONVERIFY_API_URL")
 		if baseURL == "" {
-			// K3s 集群内部服务地址
 			baseURL = "https://api.billionverify.com"
 		}
 	}
-	logger.Infof("📡 API Base URL: %s", baseURL)
+	logger.Infof("API base URL: %s", baseURL)
 
-	// 创建 API 客户端
+	// Create API client
 	apiClient := NewAPIClient(baseURL, logger)
 
-	// 存储到全局上下文
+	// Store in global context
 	mcpContext = &struct {
 		logger    *logrus.Logger
 		apiClient *APIClient
@@ -77,39 +75,38 @@ func main() {
 		apiClient: apiClient,
 	}
 
-	// 创建 MCP Server
-	logger.Info("📡 Creating MCP server...")
+	// Create MCP server
 	s := server.NewMCPServer("billionverify-mcp", version,
 		server.WithLogging(),
 	)
 
-	// 注册工具
+	// Register tools
 	addTools(s, logger)
-	logger.Debug("✓ Tools registered successfully")
+	logger.Debug("Tools registered")
 
-	// 注册资源
+	// Register resources
 	addResources(s, logger)
-	logger.Debug("✓ Resources registered successfully")
+	logger.Debug("Resources registered")
 
-	// 设置优雅关闭
+	// Graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go func() {
 		<-sigChan
-		logger.Info("🛑 Shutdown signal received, gracefully stopping server")
+		logger.Info("Shutdown signal received")
 		cancel()
 		os.Exit(0)
 	}()
 
-	// 启动 HTTP 服务器
+	// Start HTTP transport
 	httpTransport := NewHTTPTransport(s, logger)
 
-	// 启动会话清理
+	// Start session cleanup goroutine
 	go httpTransport.CleanupSessions(ctx)
 
-	// 创建 HTTP 路由
+	// Register HTTP routes
 	http.HandleFunc("/mcp", httpTransport.HandleMCPRequest)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -117,35 +114,32 @@ func main() {
 			"status":  "healthy",
 			"version": version,
 			"service": "billionverify-mcp",
-			"mode":    "api-proxy",
 		})
 	})
 
 	addr := fmt.Sprintf("0.0.0.0:%s", *httpPort)
-	logger.Infof("🚀 BillionVerify MCP Server v%s starting...", version)
-	logger.Infof("✅ HTTP server listening on %s", addr)
+	logger.Infof("BillionVerify MCP Server v%s listening on %s", version, addr)
+
 	mcpDomain := os.Getenv("MCP_ENDPOINT_URL")
 	if mcpDomain == "" {
 		mcpDomain = "https://mcp.billionverify.com"
 	}
-	logger.Infof("📡 Endpoint: %s/mcp?api_key=YOUR_API_KEY", mcpDomain)
+	logger.Infof("Public endpoint: %s/mcp?api_key=YOUR_API_KEY", mcpDomain)
 
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		logger.Fatalf("HTTP server error: %v", err)
 	}
 }
 
-// addTools 注册所有 MCP 工具
+// addTools registers all MCP tools.
 func addTools(s *server.MCPServer, logger *logrus.Logger) {
-	// 健康检查工具
 	healthTool := mcp.NewTool("health_check",
-		mcp.WithDescription("检查 BillionVerify MCP 服务器的健康状态"),
+		mcp.WithDescription("Check BillionVerify MCP server health status"),
 	)
 	s.AddTool(healthTool, healthCheckHandler)
 
-	// 单个邮箱验证工具
 	verifyEmailTool := mcp.NewTool("verify_single_email",
-		mcp.WithDescription("验证单个邮箱地址"),
+		mcp.WithDescription("Verify a single email address"),
 		mcp.WithString("email"),
 		mcp.WithString("api_key"),
 		mcp.WithBoolean("check_smtp"),
@@ -153,33 +147,29 @@ func addTools(s *server.MCPServer, logger *logrus.Logger) {
 	)
 	s.AddTool(verifyEmailTool, verifySingleEmailHandler)
 
-	// 批量邮箱验证工具
-	batchEmailTool := mcp.NewTool("verify_batch_emails",
-		mcp.WithDescription("批量验证多个邮箱地址（最多 50 个）"),
-		mcp.WithArray("emails"),
+	// verify_batch_emails accepts an array of email strings via the "emails" argument.
+	verifyBatchTool := mcp.NewTool("verify_batch_emails",
+		mcp.WithDescription("Verify multiple email addresses (up to 50)"),
 		mcp.WithString("api_key"),
 		mcp.WithBoolean("check_smtp"),
 	)
-	s.AddTool(batchEmailTool, verifyBatchEmailsHandler)
+	s.AddTool(verifyBatchTool, verifyBatchEmailsHandler)
 
-	// 获取账户余额工具
 	balanceTool := mcp.NewTool("get_account_balance",
-		mcp.WithDescription("查询账户积分余额"),
+		mcp.WithDescription("Get account credit balance"),
 		mcp.WithString("api_key"),
 	)
 	s.AddTool(balanceTool, getAccountBalanceHandler)
 
-	// 获取任务状态工具
-	statusTool := mcp.NewTool("get_task_status",
-		mcp.WithDescription("查询异步任务的处理状态"),
+	taskStatusTool := mcp.NewTool("get_task_status",
+		mcp.WithDescription("Get async file verification job status"),
 		mcp.WithString("api_key"),
 		mcp.WithString("task_id"),
 	)
-	s.AddTool(statusTool, getTaskStatusHandler)
+	s.AddTool(taskStatusTool, getTaskStatusHandler)
 
-	// 获取下载 URL 工具
-	downloadTool := mcp.NewTool("get_download_url",
-		mcp.WithDescription("获取文件验证结果的下载 URL，支持按状态过滤"),
+	downloadURLTool := mcp.NewTool("get_download_url",
+		mcp.WithDescription("Get download URL for file verification results, with optional status filters"),
 		mcp.WithString("api_key"),
 		mcp.WithString("job_id"),
 		mcp.WithBoolean("valid"),
@@ -189,333 +179,255 @@ func addTools(s *server.MCPServer, logger *logrus.Logger) {
 		mcp.WithBoolean("disposable"),
 		mcp.WithBoolean("unknown"),
 	)
-	s.AddTool(downloadTool, getDownloadURLHandler)
+	s.AddTool(downloadURLTool, getDownloadURLHandler)
 
-	// 创建 Webhook 工具
+	// create_webhook accepts an array of event strings via the "events" argument.
 	createWebhookTool := mcp.NewTool("create_webhook",
-		mcp.WithDescription("创建一个新的 Webhook 用于接收验证完成通知"),
+		mcp.WithDescription("Create a webhook to receive file verification completion notifications"),
 		mcp.WithString("api_key"),
 		mcp.WithString("url"),
-		mcp.WithArray("events"),
 	)
 	s.AddTool(createWebhookTool, createWebhookHandler)
 
-	// 列出 Webhook 工具
 	listWebhooksTool := mcp.NewTool("list_webhooks",
-		mcp.WithDescription("列出当前账户的所有 Webhook"),
+		mcp.WithDescription("List all webhooks for the account"),
 		mcp.WithString("api_key"),
 	)
 	s.AddTool(listWebhooksTool, listWebhooksHandler)
 
-	// 删除 Webhook 工具
 	deleteWebhookTool := mcp.NewTool("delete_webhook",
-		mcp.WithDescription("删除指定的 Webhook"),
+		mcp.WithDescription("Delete a webhook by ID"),
 		mcp.WithString("api_key"),
 		mcp.WithString("webhook_id"),
 	)
 	s.AddTool(deleteWebhookTool, deleteWebhookHandler)
 }
 
-// addResources 注册所有 MCP 资源
+// addResources registers all MCP resources.
 func addResources(s *server.MCPServer, logger *logrus.Logger) {
-	// 账户信息资源
-	accountResource := mcp.Resource{
+	s.AddResource(mcp.Resource{
 		URI:         "billionverify://account/info",
 		Name:        "Account Information",
-		Description: "获取账户信息，包括余额、使用统计等",
+		Description: "Account information including balance and usage statistics",
 		MIMEType:    "application/json",
-	}
-	s.AddResource(accountResource, accountInfoHandler)
+	}, accountInfoHandler)
 
-	// 验证历史资源
-	historyResource := mcp.Resource{
+	s.AddResource(mcp.Resource{
 		URI:         "billionverify://history/summary",
 		Name:        "Verification History",
-		Description: "获取验证历史摘要",
+		Description: "Verification history summary",
 		MIMEType:    "application/json",
-	}
-	s.AddResource(historyResource, historyHandler)
+	}, historyHandler)
 
-	// 验证统计资源
-	statsResource := mcp.Resource{
+	s.AddResource(mcp.Resource{
 		URI:         "billionverify://stats/verification",
 		Name:        "Verification Statistics",
-		Description: "获取验证统计数据",
+		Description: "Verification statistics",
 		MIMEType:    "application/json",
-	}
-	s.AddResource(statsResource, statsHandler)
+	}, statsHandler)
 }
 
-// ======================== 工具处理器 ========================
+// ======================== Tool Handlers ========================
 
-func healthCheckHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	mcpContext.logger.Debug("Health check tool called")
-
+func healthCheckHandler(arguments map[string]interface{}) (*mcp.CallToolResult, error) {
 	response := map[string]interface{}{
 		"status":    "healthy",
 		"version":   version,
 		"service":   "billionverify-mcp",
-		"mode":      "api-proxy",
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
-		"message":   "MCP 服务器正常运行（API 代理模式）",
 	}
-
-	content := mcp.NewTextContent(formatJSON(response))
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{content},
-	}, nil
+	return mcp.NewToolResultText(formatJSON(response)), nil
 }
 
-func verifySingleEmailHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// 1. 提取 API Key
-	apiKey, err := extractAPIKey(request)
+func verifySingleEmailHandler(arguments map[string]interface{}) (*mcp.CallToolResult, error) {
+	apiKey, err := extractAPIKey(arguments)
 	if err != nil {
-		return errorResult(err.Error()), nil
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	// 2. 提取邮箱参数
-	email, err := request.RequireString("email")
-	if err != nil {
-		mcpContext.logger.Warnf("Missing email parameter: %v", err)
-		return errorResult("Missing email parameter"), nil
+	email, ok := arguments["email"].(string)
+	if !ok || email == "" {
+		return mcp.NewToolResultError("Missing email parameter"), nil
 	}
 
-	// 提取可选参数
-	checkSMTP := getBoolParam(request, "check_smtp", false)
-	forceRefresh := getBoolParam(request, "force_refresh", false)
+	checkSMTP := getBoolArg(arguments, "check_smtp", false)
+	forceRefresh := getBoolArg(arguments, "force_refresh", false)
 
-	mcpContext.logger.Infof("Verify single email: %s (checkSMTP=%v, forceRefresh=%v)", email, checkSMTP, forceRefresh)
+	mcpContext.logger.Infof("verify_single_email: %s (smtp=%v refresh=%v)", email, checkSMTP, forceRefresh)
 
-	// 3. 调用外部 API
 	result, err := mcpContext.apiClient.VerifySingleEmail(apiKey, email, checkSMTP, forceRefresh)
 	if err != nil {
-		mcpContext.logger.Errorf("API call failed: %v", err)
-		return errorResult("Failed to verify email: " + err.Error()), nil
+		mcpContext.logger.Errorf("API error: %v", err)
+		return mcp.NewToolResultError("Failed to verify email: " + err.Error()), nil
 	}
 
-	content := mcp.NewTextContent(formatJSON(result))
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{content},
-	}, nil
+	return mcp.NewToolResultText(formatJSON(result)), nil
 }
 
-func verifyBatchEmailsHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// 1. 提取 API Key
-	apiKey, err := extractAPIKey(request)
+func verifyBatchEmailsHandler(arguments map[string]interface{}) (*mcp.CallToolResult, error) {
+	apiKey, err := extractAPIKey(arguments)
 	if err != nil {
-		return errorResult(err.Error()), nil
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	// 2. 提取邮箱列表
-	emails, err := request.RequireStringSlice("emails")
+	emails, err := extractStringSlice(arguments, "emails")
 	if err != nil {
-		mcpContext.logger.Warnf("Missing or invalid emails parameter: %v", err)
-		return errorResult("Missing or invalid emails parameter"), nil
+		return mcp.NewToolResultError("Missing or invalid emails parameter"), nil
 	}
 
 	if len(emails) == 0 || len(emails) > 50 {
-		return errorResult(fmt.Sprintf("邮箱数量必须在 1-50 之间，当前数量: %d", len(emails))), nil
+		return mcp.NewToolResultError(fmt.Sprintf("email count must be 1-50, got %d", len(emails))), nil
 	}
 
-	checkSMTP := getBoolParam(request, "check_smtp", false)
+	checkSMTP := getBoolArg(arguments, "check_smtp", false)
 
-	mcpContext.logger.Infof("Verify batch emails: %d emails (checkSMTP=%v)", len(emails), checkSMTP)
+	mcpContext.logger.Infof("verify_batch_emails: %d emails (smtp=%v)", len(emails), checkSMTP)
 
-	// 3. 调用外部 API
 	result, err := mcpContext.apiClient.VerifyBatchEmails(apiKey, emails, checkSMTP)
 	if err != nil {
-		mcpContext.logger.Errorf("API call failed: %v", err)
-		return errorResult("Failed to verify batch emails: " + err.Error()), nil
+		mcpContext.logger.Errorf("API error: %v", err)
+		return mcp.NewToolResultError("Failed to verify batch emails: " + err.Error()), nil
 	}
 
-	content := mcp.NewTextContent(formatJSON(result))
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{content},
-	}, nil
+	return mcp.NewToolResultText(formatJSON(result)), nil
 }
 
-func getAccountBalanceHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// 1. 提取 API Key
-	apiKey, err := extractAPIKey(request)
+func getAccountBalanceHandler(arguments map[string]interface{}) (*mcp.CallToolResult, error) {
+	apiKey, err := extractAPIKey(arguments)
 	if err != nil {
-		return errorResult(err.Error()), nil
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	mcpContext.logger.Info("Get account balance requested")
-
-	// 2. 调用外部 API
 	result, err := mcpContext.apiClient.GetAccountBalance(apiKey)
 	if err != nil {
-		mcpContext.logger.Errorf("API call failed: %v", err)
-		return errorResult("Failed to get account balance: " + err.Error()), nil
+		mcpContext.logger.Errorf("API error: %v", err)
+		return mcp.NewToolResultError("Failed to get account balance: " + err.Error()), nil
 	}
 
-	content := mcp.NewTextContent(formatJSON(result))
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{content},
-	}, nil
+	return mcp.NewToolResultText(formatJSON(result)), nil
 }
 
-func getTaskStatusHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// 1. 提取 API Key
-	apiKey, err := extractAPIKey(request)
+func getTaskStatusHandler(arguments map[string]interface{}) (*mcp.CallToolResult, error) {
+	apiKey, err := extractAPIKey(arguments)
 	if err != nil {
-		return errorResult(err.Error()), nil
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	// 2. 提取任务 ID
-	taskID, err := request.RequireString("task_id")
-	if err != nil {
-		mcpContext.logger.Warnf("Missing task_id parameter: %v", err)
-		return errorResult("Missing task_id parameter"), nil
+	taskID, ok := arguments["task_id"].(string)
+	if !ok || taskID == "" {
+		return mcp.NewToolResultError("Missing task_id parameter"), nil
 	}
 
-	mcpContext.logger.Infof("Get task status: taskId=%s", taskID)
+	mcpContext.logger.Infof("get_task_status: %s", taskID)
 
-	// 3. 调用外部 API
 	result, err := mcpContext.apiClient.GetTaskStatus(apiKey, taskID)
 	if err != nil {
-		mcpContext.logger.Errorf("API call failed: %v", err)
-		return errorResult("Failed to get task status: " + err.Error()), nil
+		mcpContext.logger.Errorf("API error: %v", err)
+		return mcp.NewToolResultError("Failed to get task status: " + err.Error()), nil
 	}
 
-	content := mcp.NewTextContent(formatJSON(result))
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{content},
-	}, nil
+	return mcp.NewToolResultText(formatJSON(result)), nil
 }
 
-func getDownloadURLHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// 1. 提取 API Key
-	apiKey, err := extractAPIKey(request)
+func getDownloadURLHandler(arguments map[string]interface{}) (*mcp.CallToolResult, error) {
+	apiKey, err := extractAPIKey(arguments)
 	if err != nil {
-		return errorResult(err.Error()), nil
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	// 2. 提取 Job ID
-	jobID, err := request.RequireString("job_id")
-	if err != nil {
-		mcpContext.logger.Warnf("Missing job_id parameter: %v", err)
-		return errorResult("Missing job_id parameter"), nil
+	jobID, ok := arguments["job_id"].(string)
+	if !ok || jobID == "" {
+		return mcp.NewToolResultError("Missing job_id parameter"), nil
 	}
 
-	// 3. 提取过滤参数
 	filters := make(map[string]bool)
-	filterNames := []string{"valid", "invalid", "catchall", "role", "disposable", "unknown"}
-	for _, name := range filterNames {
-		if val := getBoolParam(request, name, false); val {
+	for _, name := range []string{"valid", "invalid", "catchall", "role", "disposable", "unknown"} {
+		if getBoolArg(arguments, name, false) {
 			filters[name] = true
 		}
 	}
 
-	mcpContext.logger.Infof("Get download URL: jobId=%s, filters=%v", jobID, filters)
+	mcpContext.logger.Infof("get_download_url: job=%s filters=%v", jobID, filters)
 
-	// 4. 调用外部 API
 	result, err := mcpContext.apiClient.GetDownloadURL(apiKey, jobID, filters)
 	if err != nil {
-		mcpContext.logger.Errorf("API call failed: %v", err)
-		return errorResult("Failed to get download URL: " + err.Error()), nil
+		mcpContext.logger.Errorf("API error: %v", err)
+		return mcp.NewToolResultError("Failed to get download URL: " + err.Error()), nil
 	}
 
-	content := mcp.NewTextContent(formatJSON(result))
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{content},
-	}, nil
+	return mcp.NewToolResultText(formatJSON(result)), nil
 }
 
-func createWebhookHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// 1. 提取 API Key
-	apiKey, err := extractAPIKey(request)
+func createWebhookHandler(arguments map[string]interface{}) (*mcp.CallToolResult, error) {
+	apiKey, err := extractAPIKey(arguments)
 	if err != nil {
-		return errorResult(err.Error()), nil
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	// 2. 提取 URL
-	webhookURL, err := request.RequireString("url")
-	if err != nil {
-		mcpContext.logger.Warnf("Missing url parameter: %v", err)
-		return errorResult("Missing url parameter"), nil
+	webhookURL, ok := arguments["url"].(string)
+	if !ok || webhookURL == "" {
+		return mcp.NewToolResultError("Missing url parameter"), nil
 	}
 
-	// 3. 提取事件列表
-	events, err := request.RequireStringSlice("events")
+	events, err := extractStringSlice(arguments, "events")
 	if err != nil {
-		mcpContext.logger.Warnf("Missing or invalid events parameter: %v", err)
-		return errorResult("Missing or invalid events parameter"), nil
+		return mcp.NewToolResultError("Missing or invalid events parameter"), nil
 	}
 
-	mcpContext.logger.Infof("Create webhook: url=%s, events=%v", webhookURL, events)
+	mcpContext.logger.Infof("create_webhook: url=%s events=%v", webhookURL, events)
 
-	// 4. 调用外部 API
 	result, err := mcpContext.apiClient.CreateWebhook(apiKey, webhookURL, events)
 	if err != nil {
-		mcpContext.logger.Errorf("API call failed: %v", err)
-		return errorResult("Failed to create webhook: " + err.Error()), nil
+		mcpContext.logger.Errorf("API error: %v", err)
+		return mcp.NewToolResultError("Failed to create webhook: " + err.Error()), nil
 	}
 
-	content := mcp.NewTextContent(formatJSON(result))
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{content},
-	}, nil
+	return mcp.NewToolResultText(formatJSON(result)), nil
 }
 
-func listWebhooksHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// 1. 提取 API Key
-	apiKey, err := extractAPIKey(request)
+func listWebhooksHandler(arguments map[string]interface{}) (*mcp.CallToolResult, error) {
+	apiKey, err := extractAPIKey(arguments)
 	if err != nil {
-		return errorResult(err.Error()), nil
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	mcpContext.logger.Info("List webhooks requested")
-
-	// 2. 调用外部 API
 	result, err := mcpContext.apiClient.ListWebhooks(apiKey)
 	if err != nil {
-		mcpContext.logger.Errorf("API call failed: %v", err)
-		return errorResult("Failed to list webhooks: " + err.Error()), nil
+		mcpContext.logger.Errorf("API error: %v", err)
+		return mcp.NewToolResultError("Failed to list webhooks: " + err.Error()), nil
 	}
 
-	content := mcp.NewTextContent(formatJSON(result))
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{content},
-	}, nil
+	return mcp.NewToolResultText(formatJSON(result)), nil
 }
 
-func deleteWebhookHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// 1. 提取 API Key
-	apiKey, err := extractAPIKey(request)
+func deleteWebhookHandler(arguments map[string]interface{}) (*mcp.CallToolResult, error) {
+	apiKey, err := extractAPIKey(arguments)
 	if err != nil {
-		return errorResult(err.Error()), nil
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	// 2. 提取 Webhook ID
-	webhookID, err := request.RequireString("webhook_id")
-	if err != nil {
-		mcpContext.logger.Warnf("Missing webhook_id parameter: %v", err)
-		return errorResult("Missing webhook_id parameter"), nil
+	webhookID, ok := arguments["webhook_id"].(string)
+	if !ok || webhookID == "" {
+		return mcp.NewToolResultError("Missing webhook_id parameter"), nil
 	}
 
-	mcpContext.logger.Infof("Delete webhook: webhookId=%s", webhookID)
+	mcpContext.logger.Infof("delete_webhook: %s", webhookID)
 
-	// 3. 调用外部 API
 	result, err := mcpContext.apiClient.DeleteWebhook(apiKey, webhookID)
 	if err != nil {
-		mcpContext.logger.Errorf("API call failed: %v", err)
-		return errorResult("Failed to delete webhook: " + err.Error()), nil
+		mcpContext.logger.Errorf("API error: %v", err)
+		return mcp.NewToolResultError("Failed to delete webhook: " + err.Error()), nil
 	}
 
-	content := mcp.NewTextContent(formatJSON(result))
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{content},
-	}, nil
+	return mcp.NewToolResultText(formatJSON(result)), nil
 }
 
-// ======================== 资源处理器 ========================
+// ======================== Resource Handlers ========================
 
-func accountInfoHandler(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+func accountInfoHandler(request mcp.ReadResourceRequest) ([]interface{}, error) {
 	apiKey := extractAPIKeyFromURI(request.Params.URI)
 	if apiKey == "" {
-		return nil, fmt.Errorf("missing api_key parameter in URI")
+		return nil, fmt.Errorf("missing api_key in URI")
 	}
 
 	result, err := mcpContext.apiClient.GetAccountBalance(apiKey)
@@ -523,104 +435,96 @@ func accountInfoHandler(ctx context.Context, request mcp.ReadResourceRequest) ([
 		return nil, fmt.Errorf("failed to get account info: %w", err)
 	}
 
-	return []mcp.ResourceContents{
-		&mcp.TextResourceContents{
-			URI:      request.Params.URI,
-			MIMEType: "application/json",
-			Text:     formatJSON(result),
+	return []interface{}{
+		mcp.TextResourceContents{
+			ResourceContents: mcp.ResourceContents{
+				URI:      request.Params.URI,
+				MIMEType: "application/json",
+			},
+			Text: formatJSON(result),
 		},
 	}, nil
 }
 
-func historyHandler(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+func historyHandler(request mcp.ReadResourceRequest) ([]interface{}, error) {
 	apiKey := extractAPIKeyFromURI(request.Params.URI)
 	if apiKey == "" {
-		return nil, fmt.Errorf("missing api_key parameter in URI")
+		return nil, fmt.Errorf("missing api_key in URI")
 	}
 
-	// 默认分页参数
-	page := 1
-	limit := 20
-
-	result, err := mcpContext.apiClient.GetVerificationHistory(apiKey, page, limit)
+	result, err := mcpContext.apiClient.GetVerificationHistory(apiKey, 1, 20)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get history: %w", err)
 	}
 
-	return []mcp.ResourceContents{
-		&mcp.TextResourceContents{
-			URI:      request.Params.URI,
-			MIMEType: "application/json",
-			Text:     formatJSON(result),
+	return []interface{}{
+		mcp.TextResourceContents{
+			ResourceContents: mcp.ResourceContents{
+				URI:      request.Params.URI,
+				MIMEType: "application/json",
+			},
+			Text: formatJSON(result),
 		},
 	}, nil
 }
 
-func statsHandler(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+func statsHandler(request mcp.ReadResourceRequest) ([]interface{}, error) {
 	apiKey := extractAPIKeyFromURI(request.Params.URI)
 	if apiKey == "" {
-		return nil, fmt.Errorf("missing api_key parameter in URI")
+		return nil, fmt.Errorf("missing api_key in URI")
 	}
 
-	// 默认查询月度统计
-	period := "month"
-
-	result, err := mcpContext.apiClient.GetVerificationStats(apiKey, period)
+	result, err := mcpContext.apiClient.GetVerificationStats(apiKey, "month")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get stats: %w", err)
 	}
 
-	return []mcp.ResourceContents{
-		&mcp.TextResourceContents{
-			URI:      request.Params.URI,
-			MIMEType: "application/json",
-			Text:     formatJSON(result),
+	return []interface{}{
+		mcp.TextResourceContents{
+			ResourceContents: mcp.ResourceContents{
+				URI:      request.Params.URI,
+				MIMEType: "application/json",
+			},
+			Text: formatJSON(result),
 		},
 	}, nil
 }
 
-// ======================== 辅助函数 ========================
+// ======================== Helpers ========================
 
-func extractAPIKey(request mcp.CallToolRequest) (string, error) {
-	args := request.GetArguments()
-	if apiKey, ok := args["api_key"].(string); ok && apiKey != "" {
+func extractAPIKey(arguments map[string]interface{}) (string, error) {
+	if apiKey, ok := arguments["api_key"].(string); ok && apiKey != "" {
 		return apiKey, nil
 	}
-	return "", fmt.Errorf("missing or invalid api_key parameter")
+	// Fall back to environment variable
+	if apiKey := os.Getenv("BILLIONVERIFY_API_KEY"); apiKey != "" {
+		return apiKey, nil
+	}
+	return "", fmt.Errorf("missing api_key: set BILLIONVERIFY_API_KEY env var or pass api_key parameter")
 }
 
 func extractAPIKeyFromURI(uri string) string {
-	// 从 URI 查询参数中提取 api_key
-	// 格式: billionverify://account/info?api_key=xxx
-
-	// 尝试解析 URI
+	// Format: billionverify://account/info?api_key=xxx
 	parsed, err := url.Parse(uri)
 	if err != nil {
-		mcpContext.logger.Warnf("Failed to parse URI: %v", err)
 		return ""
 	}
-
-	// 从查询参数中提取 api_key
-	apiKey := parsed.Query().Get("api_key")
-	if apiKey != "" {
-		return apiKey
+	if key := parsed.Query().Get("api_key"); key != "" {
+		return key
 	}
-
-	// 尝试从 fragment 中提取（某些客户端可能使用 fragment）
+	// Also check fragment (some clients use it)
 	if parsed.Fragment != "" {
-		fragValues, err := url.ParseQuery(parsed.Fragment)
-		if err == nil {
-			if key := fragValues.Get("api_key"); key != "" {
+		if vals, err := url.ParseQuery(parsed.Fragment); err == nil {
+			if key := vals.Get("api_key"); key != "" {
 				return key
 			}
 		}
 	}
-
 	return ""
 }
 
-func getBoolParam(request mcp.CallToolRequest, name string, defaultValue bool) bool {
-	if val, ok := request.GetArguments()[name]; ok {
+func getBoolArg(arguments map[string]interface{}, name string, defaultValue bool) bool {
+	if val, ok := arguments[name]; ok {
 		if b, ok := val.(bool); ok {
 			return b
 		}
@@ -628,16 +532,25 @@ func getBoolParam(request mcp.CallToolRequest, name string, defaultValue bool) b
 	return defaultValue
 }
 
-func errorResult(message string) *mcp.CallToolResult {
-	response := map[string]interface{}{
-		"error":   true,
-		"message": message,
+// extractStringSlice converts a JSON array argument to []string.
+func extractStringSlice(arguments map[string]interface{}, name string) ([]string, error) {
+	raw, ok := arguments[name]
+	if !ok {
+		return nil, fmt.Errorf("missing argument: %s", name)
 	}
-	content := mcp.NewTextContent(formatJSON(response))
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{content},
-		IsError: true,
+	slice, ok := raw.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("argument %s is not an array", name)
 	}
+	result := make([]string, 0, len(slice))
+	for _, item := range slice {
+		s, ok := item.(string)
+		if !ok {
+			return nil, fmt.Errorf("argument %s contains non-string element", name)
+		}
+		result = append(result, s)
+	}
+	return result, nil
 }
 
 func formatJSON(v interface{}) string {
