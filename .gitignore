@@ -1,0 +1,7 @@
+# Build output
+billionverify-mcp
+*.exe
+
+# Go workspace
+go.work
+go.work.sum
