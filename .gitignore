@@ -1,5 +1,6 @@
 # Build output
 billionverify-mcp
+go-mcp-server
 *.exe
 
 # Go workspace
